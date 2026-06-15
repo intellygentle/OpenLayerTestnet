@@ -1,0 +1,28 @@
+# Sensitive files - NEVER commit!
+.env
+master_privatekey.txt
+wallets.txt
+proxy.txt
+
+# User config & runtime data
+missions.json
+last_missions.json
+
+# Auto-generated / compiled artifacts
+disperse_contract.txt
+disperse_bytecode.txt
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Dev notes / temp files
+nul
+next update.txt
+
+# Unused / deprecated scripts (different chain or replaced)
+main.py
+transfer_usdc_plus.py
+github_push.py
