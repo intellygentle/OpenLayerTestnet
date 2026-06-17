@@ -7,9 +7,11 @@ completing daily missions on the Sepolia Testnet.
 Missions supported:
   1. Mint    - Convert USDT/USDC into USDT+/USDC+
   2. Stake   - Lock USDT+/USDC+ in staking contracts
-  3. Send    - Transfer USDT+/USDC+ to your target wallet
-  4. Receive - Target wallet receives tokens (auto-completed with Send)
+  3. Send    - Transfer both USDT+ and USDC+ to your target wallet (same amount each)
+  4. Receive - Target wallet receives both USDT+ and USDC+ (auto-completed with Send + Return)
   5. Daily TX - Ensure minimum transaction count
+  6. Liquidity - Provide USDT+/USDC+ as liquidity to MasterChef pool
+  7. sC+ Liquidity - Provide sC+ (staked USDC+) as liquidity to sC+ pool
 
 How to use:
   python daily_missions.py
@@ -17,9 +19,11 @@ How to use:
 The script will ask you questions based on today's mission format:
   "Mint at least 244 USDT+ on ETH Sep"
   "Stake at least 447 USDC+ on ETH Sep"
-  "Send at least 250 USDC+ on ETH Sep"
-  "Receive at least 316 USDC+ on ETH Sep"
+  "Send at least 250 USDT+ and USDC+ on ETH Sep"
+  "Receive at least 316 USDT+ and USDC+ on ETH Sep"
   "Make at least 11 tx (mint, stake, or bridge) on ETH Sep"
+  "Provide USDT+ as liquidity on ETH Sep"
+  "Provide sC+ (staked USDC+) as liquidity on ETH Sep"
 
 Check your daily missions at: https://testnet.overlayer.fi/early-user
 """
@@ -84,6 +88,24 @@ TOKENS = {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+# Liquidity Pool Config (MasterChef-style)
+# ═══════════════════════════════════════════════════════════════════
+
+LIQUIDITY_CONTRACT    = "0xDa11726d1d66c8c5c7224529f7be58f22b808952"  # USDT+/USDC+ pool
+SC_LIQUIDITY_CONTRACT = "0x88Fe18C721c9380f80592Cb1496C50C7Ea97ABeB"  # sC+ pool
+LIQUID_POOL_ID = 0
+
+SC_TOKEN_CONFIG = {
+    "name": "sC+",
+    "full_name": "Staked USDC+",
+    "address": "0x753937137eb92871a6f3517514d4f1ee860e3fdf",
+    "underlying": "usdc",
+    "decimals": 18,
+}
+
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Contract Function Selectors
 # ═══════════════════════════════════════════════════════════════════
 
@@ -91,6 +113,9 @@ MINT_SELECTOR     = "2ef6f1ab"   # mint(tuple(address,address,address,uint256,ui
 DEPOSIT_SELECTOR  = "6e553f65"   # deposit(uint256 assets, address receiver)
 TRANSFER_SELECTOR = "a9059cbb"   # transfer(address to, uint256 amount)
 BALANCE_SELECTOR  = "70a08231"   # balanceOf(address)
+DEPOSIT_LP_SELECTOR = "e2bbb158"  # deposit(uint256 _pid, uint256 _amount) - MasterChef
+APPROVE_SELECTOR    = "095ea7b3"  # approve(address spender, uint256 amount)
+ALLOWANCE_SELECTOR  = "dd62ed3e"  # allowance(address owner, address spender)
 
 # ═══════════════════════════════════════════════════════════════════
 # Default Settings
@@ -228,6 +253,33 @@ def build_send_calldata(recipient, amount_raw):
     return "0x" + "".join(parts)
 
 
+def build_deposit_lp_calldata(pid, amount_raw):
+    """Encode deposit(uint256 _pid, uint256 _amount) - MasterChef style."""
+    parts = [DEPOSIT_LP_SELECTOR]
+    parts.append(p32(pid))
+    parts.append(p32(amount_raw))
+    return "0x" + "".join(parts)
+
+
+def build_approve_calldata(spender, amount_raw):
+    """Encode approve(address spender, uint256 amount)."""
+    parts = [APPROVE_SELECTOR]
+    parts.append(p32(int(spender.lower().replace("0x", ""), 16)))
+    parts.append(p32(amount_raw))
+    return "0x" + "".join(parts)
+
+
+def get_allowance(owner, spender, token_addr, rpc_url):
+    """Query ERC-20 allowance."""
+    data = "0x" + ALLOWANCE_SELECTOR
+    data += p32(int(owner.lower().replace("0x", ""), 16))
+    data += p32(int(spender.lower().replace("0x", ""), 16))
+    result = rpc_call(rpc_url, "eth_call", [{"to": token_addr, "data": data}, "latest"])
+    if result and "result" in result:
+        return int(result["result"], 16)
+    return 0
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Config Save/Load
 # ═══════════════════════════════════════════════════════════════════
@@ -271,9 +323,11 @@ def mission_wizard():
     print(f"  {BOLD_WHITE}Today's missions look like this:{RESET}")
     print(f"  {DIM}  'Mint at least 244 USDT+ on ETH Sep'{RESET}")
     print(f"  {DIM}  'Stake at least 447 USDC+ on ETH Sep'{RESET}")
-    print(f"  {DIM}  'Send at least 250 USDC+ on ETH Sep'{RESET}")
-    print(f"  {DIM}  'Receive at least 316 USDC+ on ETH Sep'{RESET}")
+    print(f"  {DIM}  'Send at least 250 USDT+ and USDC+ on ETH Sep'{RESET}")
+    print(f"  {DIM}  'Receive at least 316 USDT+ and USDC+ on ETH Sep'{RESET}")
     print(f"  {DIM}  'Make at least 11 tx (mint, stake, or bridge) on ETH Sep'{RESET}")
+    print(f"  {DIM}  'Provide USDT+ as liquidity on ETH Sep'{RESET}")
+    print(f"  {DIM}  'Provide sC+ (staked USDC+) as liquidity on ETH Sep'{RESET}")
     print()
 
     # Check for saved config
@@ -295,7 +349,7 @@ def mission_wizard():
 
     # ── Step 1: Mint Mission ──
     print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
-    print(f"  {BOLD_YELLOW}Step 1/5: MINT Mission{RESET}")
+    print(f"  {BOLD_YELLOW}Step 1/7: MINT Mission{RESET}")
     print(f"  {BOLD_WHITE}(Example: 'Mint at least 244 USDT+ on ETH Sep'){RESET}")
     print(f"{BOLD_MAGENTA}{'─' * 60}{RESET}")
 
@@ -315,7 +369,7 @@ def mission_wizard():
 
     # ── Step 2: Stake Mission ──
     print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
-    print(f"  {BOLD_YELLOW}Step 2/5: STAKE Mission{RESET}")
+    print(f"  {BOLD_YELLOW}Step 2/7: STAKE Mission{RESET}")
     print(f"  {BOLD_WHITE}(Example: 'Stake at least 447 USDC+ on ETH Sep'){RESET}")
     print(f"{BOLD_MAGENTA}{'─' * 60}{RESET}")
 
@@ -333,50 +387,46 @@ def mission_wizard():
     else:
         log_info("Skipped Stake mission")
 
-    # ── Step 3: Send Mission ──
+    # ── Step 3: Send Mission (both USDT+ and USDC+) ──
     print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
-    print(f"  {BOLD_YELLOW}Step 3/5: SEND Mission{RESET}")
-    print(f"  {BOLD_WHITE}(Example: 'Send at least 250 USDC+ on ETH Sep'){RESET}")
+    print(f"  {BOLD_YELLOW}Step 3/7: SEND Mission{RESET}")
+    print(f"  {BOLD_WHITE}(Example: 'Send at least 250 USDT+ and USDC+ on ETH Sep'){RESET}")
+    print(f"  {DIM}This will send the same amount of BOTH USDT+ and USDC+ to your target wallet.{RESET}")
     print(f"{BOLD_MAGENTA}{'─' * 60}{RESET}")
 
     if _ask_yesno("Do you have a SEND mission today?", "y"):
-        token = _ask_token("Which token to send")
-        cfg = TOKENS[token]
-        amount = _ask_number(f"Minimum {cfg['plus_name']} to send", min_val=0.01)
+        amount = _ask_number("Minimum USDT+ and USDC+ to send (each)", min_val=0.01)
         missions.append({
             "type": "send",
-            "token": token,
             "amount": amount,
-            "label": f"Send >= {amount} {cfg['plus_name']}",
+            "label": f"Send >= {amount} USDT+ and USDC+",
         })
-        print(f"  {BOLD_GREEN}  + Added: Send {amount} {cfg['plus_name']}{RESET}")
+        print(f"  {BOLD_GREEN}  + Added: Send {amount} USDT+ and USDC+ each{RESET}")
     else:
         log_info("Skipped Send mission")
 
-    # ── Step 4: Receive Mission ──
+    # ── Step 4: Receive Mission (both USDT+ and USDC+) ──
     print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
-    print(f"  {BOLD_YELLOW}Step 4/5: RECEIVE Mission{RESET}")
-    print(f"  {BOLD_WHITE}(Example: 'Receive at least 316 USDC+ on ETH Sep'){RESET}")
+    print(f"  {BOLD_YELLOW}Step 4/7: RECEIVE Mission{RESET}")
+    print(f"  {BOLD_WHITE}(Example: 'Receive at least 316 USDT+ and USDC+ on ETH Sep'){RESET}")
     print(f"  {DIM}Note: Receive is auto-completed by sending to your target wallet.{RESET}")
+    print(f"  {DIM}When you send both USDT+ and USDC+, the receive is fulfilled.{RESET}")
     print(f"{BOLD_MAGENTA}{'─' * 60}{RESET}")
 
     if _ask_yesno("Do you have a RECEIVE mission today?", "n"):
-        token = _ask_token("Which token to receive")
-        cfg = TOKENS[token]
-        amount = _ask_number(f"Minimum {cfg['plus_name']} to receive", min_val=0.01)
+        amount = _ask_number("Minimum USDT+ and USDC+ to receive (each)", min_val=0.01)
         missions.append({
             "type": "receive",
-            "token": token,
             "amount": amount,
-            "label": f"Receive >= {amount} {cfg['plus_name']}",
+            "label": f"Receive >= {amount} USDT+ and USDC+",
         })
-        print(f"  {BOLD_GREEN}  + Added: Receive {amount} {cfg['plus_name']}{RESET}")
+        print(f"  {BOLD_GREEN}  + Added: Receive {amount} USDT+ and USDC+ each{RESET}")
     else:
         log_info("Skipped Receive mission")
 
     # ── Step 5: Daily TX Mission ──
     print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
-    print(f"  {BOLD_YELLOW}Step 5/5: DAILY TRANSACTIONS Mission{RESET}")
+    print(f"  {BOLD_YELLOW}Step 5/7: DAILY TRANSACTIONS Mission{RESET}")
     print(f"  {BOLD_WHITE}(Example: 'Make at least 11 tx on ETH Sep'){RESET}")
     print(f"  {DIM}Note: If needed, small filler mint txs will be added to reach the count.{RESET}")
     print(f"{BOLD_MAGENTA}{'─' * 60}{RESET}")
@@ -395,6 +445,46 @@ def mission_wizard():
         print(f"  {BOLD_GREEN}  + Added: >= {min_tx} daily transactions (filler: {settings['daily_tx_amount']}/tx){RESET}")
     else:
         log_info("Skipped Daily TX mission")
+
+    # ── Step 6: Provide Liquidity Mission (USDT+/USDC+ → Pool) ──
+    print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
+    print(f"  {BOLD_YELLOW}Step 6/7: LIQUIDITY Mission{RESET}")
+    print(f"  {BOLD_WHITE}(Example: 'Provide USDT+ as liquidity on ETH Sep'){RESET}")
+    print(f"  {DIM}Deposit USDT+ or USDC+ into the MasterChef liquidity pool.{RESET}")
+    print(f"{BOLD_MAGENTA}{'─' * 60}{RESET}")
+
+    if _ask_yesno("Do you have a LIQUIDITY mission today?", "y"):
+        token = _ask_token("Which token to provide as liquidity")
+        cfg = TOKENS[token]
+        amount = _ask_number(f"Minimum {cfg['plus_name']} to provide as liquidity", min_val=0.01)
+        missions.append({
+            "type": "liquidity",
+            "token": token,
+            "amount": amount,
+            "label": f"Provide >= {amount} {cfg['plus_name']} as liquidity",
+        })
+        print(f"  {BOLD_GREEN}  + Added: Provide {amount} {cfg['plus_name']} as liquidity{RESET}")
+    else:
+        log_info("Skipped Liquidity mission")
+
+    # ── Step 7: sC+ Liquidity Mission ──
+    print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
+    print(f"  {BOLD_YELLOW}Step 7/7: sC+ LIQUIDITY Mission{RESET}")
+    print(f"  {BOLD_WHITE}(Example: 'Provide sC+ (staked USDC+) as liquidity on ETH Sep'){RESET}")
+    print(f"  {DIM}Deposit sC+ (staked USDC+ receipt token) into the sC+ liquidity pool.{RESET}")
+    print(f"  {DIM}Tip: First stake USDC+ to get sC+ tokens, then provide them as liquidity.{RESET}")
+    print(f"{BOLD_MAGENTA}{'─' * 60}{RESET}")
+
+    if _ask_yesno("Do you have an sC+ LIQUIDITY mission today?", "n"):
+        amount = _ask_number(f"Minimum sC+ to provide as liquidity", min_val=0.01)
+        missions.append({
+            "type": "sc_liquidity",
+            "amount": amount,
+            "label": f"Provide >= {amount} sC+ (staked USDC+) as liquidity",
+        })
+        print(f"  {BOLD_GREEN}  + Added: Provide {amount} sC+ as liquidity{RESET}")
+    else:
+        log_info("Skipped sC+ Liquidity mission")
 
     # ── Advanced Settings ──
     print(f"\n{BOLD_MAGENTA}{'─' * 60}{RESET}")
@@ -441,19 +531,39 @@ def analyze_and_plan(missions, settings, balances):
     stake_needs   = {}
     send_needs    = {}
     receive_needs = {}
+    liquidity_needs = []
+    sc_liquidity_needs = []
     min_tx_count  = 0
 
     for m in missions:
         mtype = m["type"]
-        token = m.get("token", "usdc")
+        token = m.get("token", "")
         if mtype == "mint":
             mint_targets[token] = mint_targets.get(token, 0) + m.get("amount", 0)
         elif mtype == "stake":
             stake_needs[token] = stake_needs.get(token, 0) + m.get("amount", 0)
         elif mtype == "send":
-            send_needs[token] = send_needs.get(token, 0) + m.get("amount", 0)
+            if token:
+                # Single-token send (legacy format with token key)
+                send_needs[token] = send_needs.get(token, 0) + m.get("amount", 0)
+            else:
+                # Both-tokens send (new format without token key)
+                amt = m.get("amount", 0)
+                send_needs["usdt"] = send_needs.get("usdt", 0) + amt
+                send_needs["usdc"] = send_needs.get("usdc", 0) + amt
         elif mtype == "receive":
-            receive_needs[token] = receive_needs.get(token, 0) + m.get("amount", 0)
+            if token:
+                # Single-token receive (legacy format with token key)
+                receive_needs[token] = receive_needs.get(token, 0) + m.get("amount", 0)
+            else:
+                # Both-tokens receive (new format without token key)
+                amt = m.get("amount", 0)
+                receive_needs["usdt"] = receive_needs.get("usdt", 0) + amt
+                receive_needs["usdc"] = receive_needs.get("usdc", 0) + amt
+        elif mtype == "liquidity":
+            liquidity_needs.append({"token": token, "amount": m.get("amount", 0)})
+        elif mtype == "sc_liquidity":
+            sc_liquidity_needs.append({"amount": m.get("amount", 0)})
         elif mtype == "daily_tx":
             min_tx_count = max(min_tx_count, m.get("min_count", 0))
 
@@ -518,6 +628,8 @@ def analyze_and_plan(missions, settings, balances):
         sum(m["tx_count"] for m in plan_mints.values())
         + len(plan_stakes)
         + len(plan_sends)
+        + len(liquidity_needs)
+        + len(sc_liquidity_needs)
     )
 
     # Filler mints for daily TX minimum (separate from mint missions!)
@@ -548,11 +660,22 @@ def analyze_and_plan(missions, settings, balances):
         filler_mints[filler_token] = {"tx_count": shortfall, "per_tx": daily_tx_amount}
         total_txs += min_tx_count
 
+    # Build liquidity lists
+    plan_liquidity = []
+    for liq in liquidity_needs:
+        plan_liquidity.append({"token": liq["token"], "amount": liq["amount"]})
+
+    plan_sc_liquidity = []
+    for liq in sc_liquidity_needs:
+        plan_sc_liquidity.append({"amount": liq["amount"]})
+
     return {
         "mints": plan_mints,
         "filler_mints": filler_mints,
         "stakes": plan_stakes,
         "sends": plan_sends,
+        "liquidity": plan_liquidity,
+        "sc_liquidity": plan_sc_liquidity,
         "total_txs": total_txs,
         "extra_added": extra_added,
         "min_tx_count": min_tx_count,
@@ -617,7 +740,19 @@ def show_plan(plan, balances, dest_addr):
                 label = "Send"
             print(f"  {BOLD_CYAN}{label}{RESET} {cfg['plus_name']:6s}: 1 tx x {s['amount']:.2f} -> {dest_addr[:10]}...")
 
-    if not has_any and not stakes and not sends:
+    liqui = plan.get("liquidity", [])
+    sc_liqui = plan.get("sc_liquidity", [])
+
+    if liqui:
+        for liq in liqui:
+            cfg = TOKENS[liq["token"]]
+            print(f"  {BOLD_CYAN}Liq{RESET}  {cfg['plus_name']:6s}: 1 tx x {liq['amount']:.2f} -> Pool #0")
+
+    if sc_liqui:
+        for liq in sc_liqui:
+            print(f"  {BOLD_CYAN}sC+Liq{RESET} sC+    : 1 tx x {liq['amount']:.2f} -> sC+ Pool #0")
+
+    if not has_any and not stakes and not sends and not liqui and not sc_liqui:
         print(f"  {BOLD_YELLOW}No transactions needed! All missions already satisfied.{RESET}")
 
     print(f"  {'─' * 58}")
@@ -633,6 +768,8 @@ def show_plan(plan, balances, dest_addr):
         + filler_tx * GAS_MINT
         + len(stakes) * GAS_STAKE
         + len(sends) * GAS_SEND
+        + len(liqui) * GAS_LIQUIDITY
+        + len(sc_liqui) * GAS_LIQUIDITY
     )
     est_eth = total_gas * 30e9 / 1e18
     print(f"  {BOLD_YELLOW}Est. Gas: ~{est_eth:.6f} ETH ({total_gas:,} gas @ ~30 gwei){RESET}")
@@ -652,9 +789,11 @@ def show_plan(plan, balances, dest_addr):
 # Execution Engine
 # ═══════════════════════════════════════════════════════════════════
 
-GAS_MINT   = 200_000
-GAS_STAKE  = 250_000
-GAS_SEND   = 100_000
+GAS_MINT      = 200_000
+GAS_STAKE     = 250_000
+GAS_SEND      = 100_000
+GAS_LIQUIDITY = 300_000
+GAS_APPROVE   = 60_000
 MAX_RETRIES = 2
 RETRY_DELAY = 30  # seconds
 
@@ -974,8 +1113,8 @@ def execute_sends(plan, pk, addr, dest_addr, rpc_url, settings, total_txs):
 
 def execute_return_transfer(dest_pk, dest_addr, main_addr, rpc_url, settings, plan_sends=None):
     """
-    Interactive return transfer: lets you choose which token and how much
-    to send back from the target wallet to your main wallet.
+    Return transfer: sends tokens back from target wallet to main wallet.
+    Supports both single-token and both-tokens (USDT+ & USDC+) return.
     This completes the Receive mission by having the main wallet receive tokens.
     Returns (ok, tx_done) counts.
     """
@@ -983,10 +1122,10 @@ def execute_return_transfer(dest_pk, dest_addr, main_addr, rpc_url, settings, pl
     ok = 0
 
     print(f"\n{BOLD_MAGENTA}{'═' * 60}{RESET}")
-    print(f"  {BOLD_YELLOW}[Phase 4/4] Return Transfer - Target -> Main (Receive mission){RESET}")
+    print(f"  {BOLD_YELLOW}[Phase 5/5] Return Transfer - Target -> Main (Receive mission){RESET}")
     print(f"{BOLD_MAGENTA}{'═' * 60}{RESET}")
 
-    # Only offer tokens that were actually sent (not both unconditionally)
+    # Only offer tokens that were actually sent
     sent_tokens = sorted(set(s["token"] for s in (plan_sends or [])))
     if not sent_tokens:
         log_info("No tokens were sent — nothing to return.")
@@ -1010,80 +1149,260 @@ def execute_return_transfer(dest_pk, dest_addr, main_addr, rpc_url, settings, pl
         log_info("Target wallet has no tokens to return.")
         return ok, tx_done
 
-    # ── Ask user which token & how much to return ──
+    # ── Ask user which token(s) & how much to return ──
     print()
     if not _ask_yesno("Do you want to return tokens from the target wallet?", "y"):
         log_info("Return skipped.")
         return ok, tx_done
 
-    token = None
-    bal = 0.0
-    cfg = None
+    has_both = len(available) >= 2 and all(a[0] in ("usdt", "usdc") for a in available)
+    return_both = False
 
-    if len(available) == 1:
-        # Only one token available — use it directly
-        token, bal, cfg = available[0]
+    if has_both:
+        return_both = _ask_yesno(
+            "Return BOTH USDT+ and USDC+ to complete the Receive mission?", "y"
+        )
+
+    tokens_to_return = []
+
+    if return_both:
+        # Return both tokens — use a single amount for both
+        print()
+        return_amount = _ask_number(
+            f"Amount of each token to return (available: {available[0][1]:.6f} USDT+, {available[1][1]:.6f} USDC+)",
+            default=min(a[1] for a in available), min_val=0.000001
+        )
+        for token, bal, cfg in available:
+            actual = min(return_amount, bal)
+            if actual > 0:
+                if actual < return_amount:
+                    log_warn(f"Clamped {cfg['plus_name']} to available balance: {actual:.6f}")
+                tokens_to_return.append((token, actual, cfg))
     else:
-        # Let user pick which token to return
-        print(f"  {BOLD_WHITE}Which token do you want to return?{RESET}")
-        for i, (t, b, c) in enumerate(available, 1):
-            print(f"    {BOLD_CYAN}[{i}]{RESET} {c['plus_name']}: {b:.6f}")
+        # Single-token selection (original behavior)
+        token = None
+        bal = 0.0
+        cfg = None
 
-        while True:
-            raw = input(f"  {BOLD_WHITE}Choose (1-{len(available)}): {RESET}").strip()
-            if not raw:
-                log_info("Return skipped.")
+        if len(available) == 1:
+            token, bal, cfg = available[0]
+        else:
+            print(f"  {BOLD_WHITE}Which token do you want to return?{RESET}")
+            for i, (t, b, c) in enumerate(available, 1):
+                print(f"    {BOLD_CYAN}[{i}]{RESET} {c['plus_name']}: {b:.6f}")
+
+            while True:
+                raw = input(f"  {BOLD_WHITE}Choose (1-{len(available)}): {RESET}").strip()
+                if not raw:
+                    log_info("Return skipped.")
+                    return ok, tx_done
+                try:
+                    choice = int(raw)
+                    if 1 <= choice <= len(available):
+                        token, bal, cfg = available[choice - 1]
+                        break
+                    log_error(f"Please enter 1-{len(available)}")
+                except ValueError:
+                    log_error("Please enter a number")
+
+        print()
+        return_amount = _ask_number(
+            f"Amount of {cfg['plus_name']} to return (available: {bal:.6f})",
+            default=bal, min_val=0.000001
+        )
+
+        actual_return = min(return_amount, bal)
+        if actual_return <= 0:
+            log_info("Return amount is zero. Skipping.")
+            return ok, tx_done
+        if actual_return < return_amount:
+            log_warn(f"Clamped to available balance: {actual_return:.6f} {cfg['plus_name']}")
+        tokens_to_return.append((token, actual_return, cfg))
+
+    # ── Execute returns ──
+    for idx, (token, amount, cfg) in enumerate(tokens_to_return):
+        if idx > 0:
+            delay = random.uniform(
+                settings.get("delay_min", DEFAULTS["delay_min"]),
+                settings.get("delay_max", DEFAULTS["delay_max"]),
+            )
+            log_info(f"Waiting {delay:.1f}s before next return...")
+            time.sleep(delay)
+
+        tx_done += 1
+        amount_raw = int(amount * 10 ** cfg["plus_decimals"])
+        send_cd = build_send_calldata(main_addr, amount_raw)
+
+        log_task(
+            f"Return {amount:.2f} "
+            f"{cfg['plus_name']} from {dest_addr[:10]}... -> {main_addr[:10]}..."
+        )
+
+        result = _send_with_retry(
+            rpc_url=rpc_url, explorer_url=SEPOLIA_EXPLORER,
+            chain_id=SEPOLIA_CHAIN_ID, pk=dest_pk, address=dest_addr,
+            to_contract=cfg["plus"], value_wei=0,
+            calldata=send_cd,
+            action_name=f"Return {amount:.2f} {cfg['plus_name']}",
+            gas_limit_override=GAS_SEND, proxy=None,
+        )
+
+        if result and result not in ("FAILED", "INSUFFICIENT", None):
+            ok += 1
+            log_success(f"  Return complete: {amount:.2f} {cfg['plus_name']}")
+        else:
+            log_error(f"  Return failed: {result}")
+            if result == "INSUFFICIENT":
+                log_error("  Target wallet needs ETH for gas. Add ETH to the target wallet.")
+
+    return ok, tx_done
+
+
+def execute_liquidity(plan, pk, addr, rpc_url, settings, total_txs):
+    """Execute all liquidity provision transactions (regular + sC+).
+    Returns (ok, tx_done) counts.
+    """
+    delay_min = settings.get("delay_min", DEFAULTS["delay_min"])
+    delay_max = settings.get("delay_max", DEFAULTS["delay_max"])
+    tx_done = 0
+    ok = 0
+
+    # ── Regular liquidity (USDT+ or USDC+ → LIQUIDITY_CONTRACT) ──
+    for idx, liq in enumerate(plan.get("liquidity", [])):
+        token = liq["token"]
+        amount = liq["amount"]
+        cfg = TOKENS[token]
+        token_addr = cfg["plus"]  # USDT+ or USDC+ contract
+
+        # Check balance
+        bal_raw = get_token_balance(rpc_url, addr, token_addr)
+        bal = bal_raw / 10 ** cfg["plus_decimals"]
+
+        actual = min(amount, bal)
+        if actual <= 0:
+            log_error(f"No {cfg['plus_name']} to provide as liquidity. Skipping.")
+            continue
+
+        if actual < amount:
+            log_warn(f"Liquidity shortfall: need {amount:.2f}, have {bal:.2f}. Providing {actual:.2f}.")
+
+        amount_raw = int(actual * 10 ** cfg["plus_decimals"])
+
+        # Approve if needed
+        current_allowance = get_allowance(addr, LIQUIDITY_CONTRACT, token_addr, rpc_url)
+        if current_allowance < amount_raw:
+            approve_cd = build_approve_calldata(LIQUIDITY_CONTRACT, amount_raw)
+            log_task(f"Approving {LIQUIDITY_CONTRACT[:10]}... to spend {actual:.6f} {cfg['plus_name']}...")
+            result = _send_with_retry(
+                rpc_url=rpc_url, explorer_url=SEPOLIA_EXPLORER,
+                chain_id=SEPOLIA_CHAIN_ID, pk=pk, address=addr,
+                to_contract=token_addr, value_wei=0,
+                calldata=approve_cd,
+                action_name=f"Approve {cfg['plus_name']} for Liquidity",
+                gas_limit_override=GAS_APPROVE, proxy=None,
+            )
+            if not result or result in ("FAILED", "INSUFFICIENT", None):
+                log_error(f"Approval failed: {result}")
                 return ok, tx_done
-            try:
-                choice = int(raw)
-                if 1 <= choice <= len(available):
-                    token, bal, cfg = available[choice - 1]
-                    break
-                log_error(f"Please enter 1-{len(available)}")
-            except ValueError:
-                log_error("Please enter a number")
+            log_success(f"  Approval complete")
 
-    # Ask how much to return (default: all)
-    print()
-    return_amount = _ask_number(
-        f"Amount of {cfg['plus_name']} to return (available: {bal:.6f})",
-        default=bal, min_val=0.000001
-    )
+        # Deposit
+        deposit_cd = build_deposit_lp_calldata(LIQUID_POOL_ID, amount_raw)
 
-    actual_return = min(return_amount, bal)
-    if actual_return <= 0:
-        log_info("Return amount is zero. Skipping.")
-        return ok, tx_done
+        tx_done += 1
+        log_task(f"[{tx_done}/{total_txs}] Provide {actual:.2f} {cfg['plus_name']} as liquidity")
 
-    if actual_return < return_amount:
-        log_warn(f"Clamped to available balance: {actual_return:.6f} {cfg['plus_name']}")
+        result = _send_with_retry(
+            rpc_url=rpc_url, explorer_url=SEPOLIA_EXPLORER,
+            chain_id=SEPOLIA_CHAIN_ID, pk=pk, address=addr,
+            to_contract=LIQUIDITY_CONTRACT, value_wei=0,
+            calldata=deposit_cd,
+            action_name=f"Provide {actual:.2f} {cfg['plus_name']} Liquidity",
+            gas_limit_override=GAS_LIQUIDITY, proxy=None,
+        )
 
-    # ── Execute the return ──
-    tx_done += 1
-    amount_raw = int(actual_return * 10 ** cfg["plus_decimals"])
-    send_cd = build_send_calldata(main_addr, amount_raw)
+        if result and result not in ("FAILED", "INSUFFICIENT", None):
+            ok += 1
+            log_success(f"  Liquidity provision complete")
+        else:
+            log_error(f"  Liquidity provision failed: {result}")
+            if result == "INSUFFICIENT":
+                log_error("Not enough ETH. Stopping.")
+                return ok, tx_done
 
-    log_task(
-        f"Return {actual_return:.2f} "
-        f"{cfg['plus_name']} from {dest_addr[:10]}... -> {main_addr[:10]}..."
-    )
+        if idx < len(plan.get("liquidity", [])) - 1:
+            delay = random.uniform(delay_min, delay_max)
+            log_info(f"Waiting {delay:.1f}s...")
+            time.sleep(delay)
 
-    result = _send_with_retry(
-        rpc_url=rpc_url, explorer_url=SEPOLIA_EXPLORER,
-        chain_id=SEPOLIA_CHAIN_ID, pk=dest_pk, address=dest_addr,
-        to_contract=cfg["plus"], value_wei=0,
-        calldata=send_cd,
-        action_name=f"Return {actual_return:.2f} {cfg['plus_name']}",
-        gas_limit_override=GAS_SEND, proxy=None,
-    )
+    # ── sC+ liquidity (sC+ → SC_LIQUIDITY_CONTRACT) ──
+    for idx, liq in enumerate(plan.get("sc_liquidity", [])):
+        amount = liq["amount"]
+        sc_cfg = SC_TOKEN_CONFIG
+        token_addr = sc_cfg["address"]
+        decimals = sc_cfg["decimals"]
 
-    if result and result not in ("FAILED", "INSUFFICIENT", None):
-        ok += 1
-        log_success(f"  Return complete: {actual_return:.2f} {cfg['plus_name']}")
-    else:
-        log_error(f"  Return failed: {result}")
-        if result == "INSUFFICIENT":
-            log_error("  Target wallet needs ETH for gas. Add ETH to the target wallet.")
+        # Check balance
+        bal_raw = get_token_balance(rpc_url, addr, token_addr)
+        bal = bal_raw / 10 ** decimals
+
+        actual = min(amount, bal)
+        if actual <= 0:
+            log_error(f"No sC+ to provide as liquidity. Skipping.")
+            log_info("  Tip: First stake USDC+ to get sC+ tokens.")
+            continue
+
+        if actual < amount:
+            log_warn(f"sC+ liquidity shortfall: need {amount:.2f}, have {bal:.2f}. Providing {actual:.2f}.")
+
+        amount_raw = int(actual * 10 ** decimals)
+
+        # Approve if needed
+        current_allowance = get_allowance(addr, SC_LIQUIDITY_CONTRACT, token_addr, rpc_url)
+        if current_allowance < amount_raw:
+            approve_cd = build_approve_calldata(SC_LIQUIDITY_CONTRACT, amount_raw)
+            log_task(f"Approving SC pool to spend {actual:.6f} sC+...")
+            result = _send_with_retry(
+                rpc_url=rpc_url, explorer_url=SEPOLIA_EXPLORER,
+                chain_id=SEPOLIA_CHAIN_ID, pk=pk, address=addr,
+                to_contract=token_addr, value_wei=0,
+                calldata=approve_cd,
+                action_name=f"Approve sC+ for Liquidity",
+                gas_limit_override=GAS_APPROVE, proxy=None,
+            )
+            if not result or result in ("FAILED", "INSUFFICIENT", None):
+                log_error(f"Approval failed: {result}")
+                return ok, tx_done
+            log_success(f"  Approval complete")
+
+        # Deposit
+        deposit_cd = build_deposit_lp_calldata(LIQUID_POOL_ID, amount_raw)
+
+        tx_done += 1
+        log_task(f"[{tx_done}/{total_txs}] Provide {actual:.2f} sC+ as liquidity")
+
+        result = _send_with_retry(
+            rpc_url=rpc_url, explorer_url=SEPOLIA_EXPLORER,
+            chain_id=SEPOLIA_CHAIN_ID, pk=pk, address=addr,
+            to_contract=SC_LIQUIDITY_CONTRACT, value_wei=0,
+            calldata=deposit_cd,
+            action_name=f"Provide {actual:.2f} sC+ Liquidity",
+            gas_limit_override=GAS_LIQUIDITY, proxy=None,
+        )
+
+        if result and result not in ("FAILED", "INSUFFICIENT", None):
+            ok += 1
+            log_success(f"  sC+ liquidity provision complete")
+        else:
+            log_error(f"  sC+ liquidity provision failed: {result}")
+            if result == "INSUFFICIENT":
+                log_error("Not enough ETH. Stopping.")
+                return ok, tx_done
+
+        if idx < len(plan.get("sc_liquidity", [])) - 1:
+            delay = random.uniform(delay_min, delay_max)
+            log_info(f"Waiting {delay:.1f}s...")
+            time.sleep(delay)
 
     return ok, tx_done
 
@@ -1100,7 +1419,7 @@ def execute_plan(plan, pk, addr, dest_addr, rpc_url, settings, dest_pk=None):
     )
     if has_mints:
         print(f"\n{BOLD_MAGENTA}{'═' * 60}{RESET}")
-        print(f"  {BOLD_YELLOW}[Phase 1/3] Mint - Converting tokens{RESET}")
+        print(f"  {BOLD_YELLOW}[Phase 1/5] Mint - Converting tokens{RESET}")
         print(f"{BOLD_MAGENTA}{'═' * 60}{RESET}")
         ok, tx, _ = execute_mints(plan, pk, addr, rpc_url, settings, plan["total_txs"])
         total_ok += ok
@@ -1109,7 +1428,7 @@ def execute_plan(plan, pk, addr, dest_addr, rpc_url, settings, dest_pk=None):
     # Phase 2: Stakes
     if plan["stakes"]:
         print(f"\n{BOLD_MAGENTA}{'═' * 60}{RESET}")
-        print(f"  {BOLD_YELLOW}[Phase 2/3] Stake - Locking tokens{RESET}")
+        print(f"  {BOLD_YELLOW}[Phase 2/5] Stake - Locking tokens{RESET}")
         print(f"{BOLD_MAGENTA}{'═' * 60}{RESET}")
         ok, tx = execute_stakes(plan, pk, addr, rpc_url, settings, plan["total_txs"])
         total_ok += ok
@@ -1118,16 +1437,26 @@ def execute_plan(plan, pk, addr, dest_addr, rpc_url, settings, dest_pk=None):
     # Phase 3: Sends
     if plan["sends"]:
         print(f"\n{BOLD_MAGENTA}{'═' * 60}{RESET}")
-        print(f"  {BOLD_YELLOW}[Phase 3/3] Send - Transferring tokens{RESET}")
+        print(f"  {BOLD_YELLOW}[Phase 3/5] Send - Transferring tokens{RESET}")
         print(f"{BOLD_MAGENTA}{'═' * 60}{RESET}")
         ok, tx = execute_sends(plan, pk, addr, dest_addr, rpc_url, settings, plan["total_txs"])
         total_ok += ok
         total_tx += tx
 
-    # Phase 4: Return Transfer (if target private key is available)
+    # Phase 4: Liquidity (regular + sC+)
+    has_liquidity = bool(plan.get("liquidity", [])) or bool(plan.get("sc_liquidity", []))
+    if has_liquidity:
+        print(f"\n{BOLD_MAGENTA}{'═' * 60}{RESET}")
+        print(f"  {BOLD_YELLOW}[Phase 4/5] Liquidity - Providing tokens to pools{RESET}")
+        print(f"{BOLD_MAGENTA}{'═' * 60}{RESET}")
+        ok, tx = execute_liquidity(plan, pk, addr, rpc_url, settings, plan["total_txs"])
+        total_ok += ok
+        total_tx += tx
+
+    # Phase 5: Return Transfer (if target private key is available)
     if dest_pk and plan["sends"]:
         print(f"\n{BOLD_MAGENTA}{'═' * 60}{RESET}")
-        print(f"  {BOLD_YELLOW}[Phase 4/4] Return Transfer - Completing Receive mission{RESET}")
+        print(f"  {BOLD_YELLOW}[Phase 5/5] Return Transfer - Completing Receive mission{RESET}")
         print(f"{BOLD_MAGENTA}{'═' * 60}{RESET}")
         ok, tx = execute_return_transfer(dest_pk, dest_addr, addr, rpc_url, settings, plan["sends"])
         total_ok += ok
@@ -1150,6 +1479,10 @@ def final_report(rpc_url, addr, dest_addr, total_ok, total_tx, missions, plan, s
         end_balances[token] = get_token_balance(rpc_url, addr, cfg["token"]) / 10 ** cfg["decimals"]
         end_balances[f"{token}_plus"] = get_token_balance(rpc_url, addr, cfg["plus"]) / 10 ** cfg["plus_decimals"]
         end_balances[f"{token}_plus_dest"] = get_token_balance(rpc_url, dest_addr, cfg["plus"]) / 10 ** cfg["plus_decimals"]
+    # sC+ balance
+    sc_addr = SC_TOKEN_CONFIG["address"]
+    sc_dec = SC_TOKEN_CONFIG["decimals"]
+    end_balances["sc_plus"] = get_token_balance(rpc_url, addr, sc_addr) / 10 ** sc_dec
 
     print(f"\n{BOLD_GREEN}{'=' * 60}{RESET}")
     print(f"{BOLD_GREEN}  ALL DONE!{RESET}")
@@ -1197,12 +1530,40 @@ def final_report(rpc_url, addr, dest_addr, total_ok, total_tx, missions, plan, s
             color = BOLD_GREEN if staked_est >= amount else BOLD_YELLOW
             print(f"  {color}[{status}]{RESET} {label} (~{staked_est:.2f}/{amount} {plus_name} staked)")
         elif mtype in ("send", "receive"):
+            if token:
+                # Single-token send/receive (legacy format with token key)
+                cfg = TOKENS.get(token, {})
+                plus_name = cfg.get("plus_name", f"{token.upper()}+")
+                dest_bal = end_balances.get(f"{token}_plus_dest", 0)
+                status = "COMPLETE" if dest_bal >= amount else "PARTIAL"
+                color = BOLD_GREEN if dest_bal >= amount else BOLD_YELLOW
+                print(f"  {color}[{status}]{RESET} {label} ({dest_bal:.2f}/{amount} {plus_name} at target)")
+            else:
+                # Both-tokens send/receive (new format without token key)
+                for t in ["usdt", "usdc"]:
+                    c = TOKENS[t]
+                    pn = c["plus_name"]
+                    db = end_balances.get(f"{t}_plus_dest", 0)
+                    st = "COMPLETE" if db >= amount else "PARTIAL"
+                    cl = BOLD_GREEN if db >= amount else BOLD_YELLOW
+                    print(f"  {cl}[{st}]{RESET} {pn:6s}: {db:.2f}/{amount} at target (from: {label})")
+        elif mtype == "liquidity":
             cfg = TOKENS.get(token, {})
             plus_name = cfg.get("plus_name", f"{token.upper()}+")
-            dest_bal = end_balances.get(f"{token}_plus_dest", 0)
-            status = "COMPLETE" if dest_bal >= amount else "PARTIAL"
-            color = BOLD_GREEN if dest_bal >= amount else BOLD_YELLOW
-            print(f"  {color}[{status}]{RESET} {label} ({dest_bal:.2f}/{amount} {plus_name} at target)")
+            # Check if balance decreased (tokens were deposited into pool)
+            starting = start_balances.get(f"{token}_plus", 0)
+            actual = end_balances.get(f"{token}_plus", 0)
+            deposited_est = max(0, starting - actual)
+            status = "COMPLETE" if deposited_est >= amount else "PARTIAL"
+            color = BOLD_GREEN if deposited_est >= amount else BOLD_YELLOW
+            print(f"  {color}[{status}]{RESET} {label} (~{deposited_est:.2f}/{amount} {plus_name} deposited)")
+        elif mtype == "sc_liquidity":
+            starting = start_balances.get("sc_plus", 0)
+            actual = end_balances.get("sc_plus", 0)
+            deposited_est = max(0, starting - actual)
+            status = "COMPLETE" if deposited_est >= amount else "PARTIAL"
+            color = BOLD_GREEN if deposited_est >= amount else BOLD_YELLOW
+            print(f"  {color}[{status}]{RESET} {label} (~{deposited_est:.2f}/{amount} sC+ deposited)")
 
     # Final balances
     print(f"\n  {BOLD_CYAN}FINAL BALANCES:{RESET}")
@@ -1472,6 +1833,10 @@ def main():
         cfg = TOKENS[token]
         balances[token] = get_token_balance(rpc_url, addr, cfg["token"]) / 10 ** cfg["decimals"]
         balances[f"{token}_plus"] = get_token_balance(rpc_url, addr, cfg["plus"]) / 10 ** cfg["plus_decimals"]
+    # sC+ balance
+    sc_addr = SC_TOKEN_CONFIG["address"]
+    sc_dec = SC_TOKEN_CONFIG["decimals"]
+    balances["sc_plus"] = get_token_balance(rpc_url, addr, sc_addr) / 10 ** sc_dec
 
     # ── Show Wallet Info ──
     print(f"\n{BOLD_CYAN}{'═' * 60}{RESET}")
@@ -1486,6 +1851,7 @@ def main():
     for token in ["usdt", "usdc"]:
         cfg = TOKENS[token]
         print(f"  {cfg['name']:5s} : {balances[token]:.6f}  |  {cfg['plus_name']:6s} : {balances[f'{token}_plus']:.6f}")
+    print(f"  sC+    : {balances['sc_plus']:.6f}  (Staked USDC+ receipt token)")
     print(f"{BOLD_CYAN}{'═' * 60}{RESET}")
 
     # ── Check minimum requirements ──
